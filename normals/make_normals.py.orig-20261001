@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+make_normals.py — 由 depth_exr + COLMAP 位姿反解 GT 法线图（不再需要 Blender 渲染 normal pass）
+
+为什么不再渲染法线（三条实证过的失败模式）：
+  1. Blender 合成器 File Output 槽位默认 save_as_render=True → 法线数据被场景色彩管理
+     （view_transform / look / exposure）色调映射，**不可逆**（n=0 会被写成交 89/255 而非 127.5）；
+  2. Cycles 的 Normal pass 在 Blender 世界系，而训练侧 rend_normal 在 COLMAP/位姿世界系
+     （实测相差 21.4°~61.4° 的固定旋转）；
+  3. 编码/符号约定跨导出容易丢失，而读取器 dataset_readers.py 固定按 (c/255)*2-1 解码。
+
+本工具的输出（位姿世界系 + (n+1)/2 编码）与 rend_normal 同系、线性、可自证（见 --verify）。
+
+用法:
+  # 生成
+  python make_normals.py --dataset /path/to/DS --out normals_geo
+  # 自检（与已有 normals/ 或 normals_geo/ 做三级坐标系审计）
+  python make_normals.py --dataset /path/to/DS --verify normals
+  # 训练/评估时直接覆盖读取器的 normals/ 约定
+  python train.py -s /path/to/DS ... --mono_normal_dir /path/to/DS/normals_geo
+  python eval_normal_error.py -m <run> --mono_normal_dir /path/to/DS/normals_geo
+
+输出约定（必须与读取器一致，改动前先读 scene/dataset_readers.py）:
+  * 8-bit RGB PNG，c = round((n+1)/2 * 255)，n 为**相机外参所在世界系**的单位法线
+  * 深度哨兵（> 1e4）像素写黑 (0,0,0)（解码为 (-1,-1,-1)，靠 depth_mask 屏蔽）
+  * 文件名 = COLMAP image name 的 stem（如 0001.png），与 images/ 同名同序
+"""
+import os
+import sys
+import glob
+import json
+import time
+import argparse
+
+import numpy as np
+import cv2
+
+try:
+    import OpenEXR
+except ImportError:
+    OpenEXR = None
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+# 允许作为独立脚本运行：自动把项目根加入 sys.path（仅用于读 colmap_loader）
+sys.path.insert(0, os.environ.get("MESHSPLAT_ROOT", "/home/yyc/Documents/Ones/mesh-splatting"))
+try:
+    from scene.colmap_loader import read_extrinsics_binary, read_intrinsics_binary, qvec2rotmat
+except Exception as e:  # noqa
+    print(f"[FATAL] 无法导入 scene.colmap_loader: {e}\n"
+          f"        设置环境变量 MESHSPLAT_ROOT=<mesh-splatting 仓库根目录> 后重试")
+    raise
+
+DEPTH_SENTINEL = 1e4          # 深度 >= 此值视为无效（Blender 背景哨兵 1e10）
+
+
+# ------------------------------------------------------------------ 几何
+def intr_to_K(cam):
+    """COLMAP camera model -> (fx, fy, cx, cy)"""
+    m, p = cam.model, list(cam.params)
+    if m == "PINHOLE":
+        return p[0], p[1], p[2], p[3]
+    if m in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL"):
+        return p[0], p[0], p[1], p[2]
+    if m in ("OPENCV", "OPENCV_FISHEYE", "FULL_OPENCV", "FOV"):
+        return p[0], p[1], p[2], p[3]
+    raise ValueError(f"unsupported camera model: {m}")
+
+
+def normals_from_depth(Z, K, sign=-1.0, jump_fix=True, jump_rel=0.03, jump_abs=0.05):
+    """相机轴深度 Z(米) -> 相机系单位法线 (H,W,3)
+
+    sign=-1 使 n = -cross(du,dv)（本项目既有 GT 的约定，用 --verify 的"同向/反向"验证）
+    """
+    H, W = Z.shape
+    fx, fy, cx, cy = K
+    valid = (Z > 1e-3) & (Z < DEPTH_SENTINEL)
+
+    u = np.arange(W)[None, :].repeat(H, 0).astype(np.float32)
+    v = np.arange(H)[:, None].repeat(W, 1).astype(np.float32)
+    a = np.stack([(u - cx) / fx, (v - cy) / fy, np.ones_like(u)], -1)
+
+    Zc = np.where(valid, Z, 0.0).astype(np.float32)
+    Zu = np.zeros_like(Zc)
+    Zv = np.zeros_like(Zc)
+    Zu[:, 1:-1] = (Zc[:, 2:] - Zc[:, :-2]) * 0.5
+    Zv[1:-1, :] = (Zc[2:, :] - Zc[:-2, :]) * 0.5
+
+    ex = np.zeros_like(a); ex[..., 0] = 1.0
+    ey = np.zeros_like(a); ey[..., 1] = 1.0
+    du = a * Zu[..., None] + Z[..., None] * ex / fx
+    dv = a * Zv[..., None] + Z[..., None] * ey / fy
+    n = sign * np.cross(du, dv)
+    n /= np.maximum(np.linalg.norm(n, axis=-1, keepdims=True), 1e-12)
+
+    if jump_fix:
+        k3 = np.ones((3, 3), np.uint8)
+        mn = cv2.erode(np.where(valid, Z, np.inf).astype(np.float32), k3)
+        mx = cv2.dilate(np.where(valid, Z, -np.inf).astype(np.float32), k3)
+        span = mx - mn
+        jump = (~valid) | (~np.isfinite(span)) | (span > (jump_rel * np.abs(Z) + jump_abs))
+        cs = np.where(jump, np.inf, span).astype(np.float32)
+        best, best_n = cs.copy(), n.copy()
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                ss = np.roll(np.roll(cs, dy, 0), dx, 1)
+                nn = np.roll(np.roll(n, dy, 0), dx, 1)
+                upd = ss < best
+                best = np.where(upd, ss, best)
+                best_n = np.where(upd[..., None], nn, best_n)
+        n = np.where((jump & np.isfinite(best))[..., None], best_n, n)
+    return n, valid
+
+
+def encode(n_world, valid, bits=8):
+    """(n+1)/2 编码为整数 PNG 数组；无效像素写 0（黑）"""
+    maxv = 255 if bits == 8 else 65535
+    c = np.zeros((*n_world.shape[:2], 3), np.uint8 if bits == 8 else np.uint16)
+    enc = np.clip(np.round((n_world + 1.0) * 0.5 * maxv), 0, maxv).astype(c.dtype)
+    c[valid] = enc[valid]
+    return c
+
+
+# ------------------------------------------------------------------ 审计
+def _kabsch(A, B):
+    Hm = A.T @ B
+    U, S, Vt = np.linalg.svd(Hm)
+    R = Vt.T @ np.diag([1, 1, np.sign(np.linalg.det(Vt.T @ U.T))]) @ U.T
+    return R, Vt.T @ U.T          # (约束为旋转, 无约束可含反射)
+
+
+def _angs(R, A, B):
+    P = A @ R.T
+    P /= np.maximum(np.linalg.norm(P, axis=1, keepdims=True), 1e-9)
+    return np.degrees(np.arccos(np.clip((P * B).sum(1), -1, 1)))
+
+
+def audit(dataset, ref_dir, depth_sub="depth_exr", n_views=4, stride=7):
+    """三级坐标系审计：全局旋转 / 逐视图旋转 / 反射，判定参考法线是否可用。"""
+    ext = read_extrinsics_binary(os.path.join(dataset, "sparse/0/images.bin"))
+    cam = list(read_intrinsics_binary(os.path.join(dataset, "sparse/0/cameras.bin")).values())[0]
+    K = intr_to_K(cam)
+    stem2 = {os.path.splitext(v.name)[0]: v for v in ext.values()}
+    per = []
+    for exr in sorted(glob.glob(os.path.join(dataset, depth_sub, "*.exr")))[:60]:
+        if len(per) >= n_views:
+            break
+        stem = os.path.splitext(os.path.basename(exr))[0]
+        png = os.path.join(dataset if os.path.isabs(ref_dir) else dataset, ref_dir, f"{stem}.png")
+        ent = stem2.get(stem)
+        if ent is None or not os.path.exists(png):
+            continue
+        Z = np.asarray(list(OpenEXR.File(exr).channels().values())[0].pixels)[..., 0].astype(np.float32)
+        st = np.array(Image.open(png).convert("RGB")).astype(np.float32)
+        H = min(Z.shape[0], st.shape[0]); W = min(Z.shape[1], st.shape[1])
+        Z, st = Z[:H, :W], st[:H, :W]
+        n_cam, valid = normals_from_depth(Z, K, sign=-1.0, jump_fix=False)
+        nw = (n_cam.reshape(-1, 3) @ qvec2rotmat(ent.qvec)).reshape((*Z.shape, 3))
+        m = valid & (st.sum(-1) > 0)
+        s = np.zeros_like(m); s[::stride, ::stride] = True
+        m &= s
+        if m.sum() < 500:
+            continue
+        A = st[m] / 255.0 * 2 - 1
+        B = nw[m]
+        A /= np.maximum(np.linalg.norm(A, axis=1, keepdims=True), 1e-9)
+        B /= np.maximum(np.linalg.norm(B, axis=1, keepdims=True), 1e-9)
+        per.append((stem, A, B))
+    if len(per) < 2:
+        print(f"[audit] 可对齐视图不足（{len(per)}），跳过"); return
+    A0, B0 = per[0][1], per[0][2]
+    print(f"[audit] 参考目录 {ref_dir}：{len(per)} 视图, N={len(A0)}")
+    for sgn, tag in [(1, "同向"), (-1, "反向")]:
+        As = A0 * sgn
+        R, Rf = _kabsch(As, B0)
+        rot = np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1)))
+        raw = np.median(_angs(np.eye(3), As, B0))
+        fit = np.median(_angs(R, As, B0))
+        oth = [np.median(_angs(R, a * sgn, b)) for _, a, b in per[1:]]
+        pv = [np.median(_angs(_kabsch(a * sgn, b)[0], a * sgn, b)) for _, a, b in per[1:]]
+        print(f"          {tag}: raw {raw:6.2f}° -> 全局 R*({rot:5.1f}°) {fit:5.2f}° | "
+              f"其余视图同 R* {['%.2f' % x for x in oth]}° | 逐视图 {['%.2f' % x for x in pv]}°")
+        print(f"                无约束最优变换 det={np.linalg.det(Rf):+.3f}, 残差 "
+              f"{np.median(_angs(Rf, As, B0)):5.2f}°")
+    print("          判读: 全局 R* 后 <5° => 仅坐标系错位（本工具输出即修正版）；"
+          "三层都救不回 => 参考数据被破坏，必须用本工具重生")
+
+
+# ------------------------------------------------------------------ 主流程
+def main():
+    ap = argparse.ArgumentParser(description="从 depth_exr + 位姿生成世界系 GT 法线")
+    ap.add_argument("--dataset", required=True, help="数据集根目录（含 sparse/0、depth_exr/）")
+    ap.add_argument("--depth-sub", default="depth_exr")
+    ap.add_argument("--out", default="normals_geo", help="输出子目录名（默认 normals_geo）")
+    ap.add_argument("--sign", default="neg", choices=["neg", "pos"],
+                    help="法线符号约定：neg = -cross(du,dv)（本项目既有约定，默认）")
+    ap.add_argument("--bits", type=int, default=8, choices=[8, 16])
+    ap.add_argument("--no-jump-fix", action="store_true", help="关闭断崖像素邻域替换")
+    ap.add_argument("--limit", type=int, default=0, help="只处理前 N 帧（调试）")
+    ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--verify", default=None, metavar="REFDIR",
+                    help="不生成，只对已有参考法线目录做三级坐标系审计")
+    args = ap.parse_args()
+
+    ds = os.path.abspath(args.dataset)
+    if args.verify:
+        audit(ds, args.verify)
+        return
+
+    if OpenEXR is None or Image is None:
+        print("[FATAL] 需要 OpenEXR 与 Pillow"); return 1
+    out_dir = os.path.join(ds, args.out)
+    os.makedirs(out_dir, exist_ok=True)
+    exts = sorted(glob.glob(os.path.join(ds, args.depth_sub, "*.exr")))
+    if args.limit:
+        exts = exts[:args.limit]
+    if not exts:
+        print(f"[FATAL] {ds}/{args.depth_sub} 下没有 .exr"); return 1
+
+    ext = read_extrinsics_binary(os.path.join(ds, "sparse/0/images.bin"))
+    cam = list(read_intrinsics_binary(os.path.join(ds, "sparse/0/cameras.bin")).values())[0]
+    K = intr_to_K(cam)
+    stem2 = {os.path.splitext(v.name)[0]: v for v in ext.values()}
+    print(f"[make_normals] {ds}\n  位姿 {len(ext)} 个 / 深度 {len(exts)} 帧 / 相机 {cam.model} "
+          f"fx={K[0]:.2f} fy={K[1]:.2f} cx={K[2]:.2f} cy={K[3]:.2f}\n"
+          f"  sign={args.sign} bits={args.bits} jump_fix={not args.no_jump_fix} -> {out_dir}")
+
+    t0 = time.time()
+    done = skipped = nopose = 0
+    fg_fracs = []
+    for exr in exts:
+        stem = os.path.splitext(os.path.basename(exr))[0]
+        dst = os.path.join(out_dir, f"{stem}.png")
+        ent = stem2.get(stem)
+        if ent is None:
+            nopose += 1; continue
+        if os.path.exists(dst) and not args.overwrite:
+            skipped += 1; continue
+        Z = np.asarray(list(OpenEXR.File(exr).channels().values())[0].pixels)[..., 0].astype(np.float32)
+        n_cam, valid = normals_from_depth(Z, K, sign=(-1.0 if args.sign == "neg" else 1.0),
+                                         jump_fix=not args.no_jump_fix)
+        n_world = (n_cam.reshape(-1, 3) @ qvec2rotmat(ent.qvec)).reshape((*Z.shape, 3))
+        n_world /= np.maximum(np.linalg.norm(n_world, axis=-1, keepdims=True), 1e-12)
+        Image.fromarray(encode(n_world, valid, args.bits)).save(dst)
+        fg_fracs.append(float(valid.mean()))
+        done += 1
+        if done % 100 == 0:
+            print(f"  {done} 帧 … {time.time()-t0:.0f}s", flush=True)
+    print(f"[make_normals] 完成: 写出 {done}, 跳过(已存在) {skipped}, 无位姿 {nopose}, "
+          f"用时 {time.time()-t0:.0f}s")
+    if fg_fracs:
+        print(f"  有效深度占比 中位 {np.median(fg_fracs)*100:.1f}%（其余写黑，靠 depth_mask 屏蔽）")
+    print(f"  训练/评估时用 --mono_normal_dir {out_dir} 覆盖读取器的 normals/ 约定")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
